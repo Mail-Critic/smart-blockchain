@@ -1,2 +1,2 @@
 # smart-blockchain
-Blockchain network with user friendly and more secure platform
+Blockchain network with user friendly and more secure platform. Smart Blockchain will have the hybrid AES encryption in blockchain data. The password will be the simple alpha numeric and it will be easy to remember (If required user can use the traditional mnemonics or hex keys). The password can be changed at ay point of time. The transaction can be reverted in the case of dispute (to avoid scammers).There are many more to be implemented. Will be keep updated based on the development. Contributors are welcome.
