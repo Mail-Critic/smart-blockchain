@@ -1,26 +1,47 @@
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
-use chrono::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use rand::Rng;
-use std::fs;
-use std::path::Path;
+use aes::Aes256;
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use chrono::Utc;
 use clap::Parser;
+use rsa::{
+    pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPrivateKey, EncodeRsaPublicKey},
+    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use uuid::Uuid;
+use block_padding::Pkcs7;
+
+type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 #[derive(Parser, Debug)]
-#[clap(about = "A simple blockchain P2P server")]
+#[clap(about = "Blockchain P2P Server")]
 struct Args {
-    /// Port to listen on
     #[clap(short = 'p', long, default_value = "8080")]
     port: String,
-
-    /// Comma-separated list of peer addresses
     #[clap(short = 'e', long, default_value = "")]
     peers: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct EncryptionKeys {
+    public_key: Vec<u8>,
+    private_key: Vec<u8>,
+    aes_key: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TransactionRecord {
+    tx_id: String,
+    counterparty: String,
+    amount: i64,
+    timestamp: i64,
+    block_height: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -41,12 +62,222 @@ struct Block {
     nonce: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum SmartContract {
+    GetBalance {
+        id: String,
+        address: String,
+        requester: String,
+    },
+    Transfer {
+        id: String,
+        sender: String,
+        receiver: String,
+        amount: u64,
+        password: String,
+    },
+    GetTransactionHistory {
+        id: String,
+        address: String,
+        requester: String,
+    },
+    GrantAccess {
+        id: String,
+        account: String,
+        granter: String,
+        grantee: String,
+        rights: Vec<AccessRight>,
+        duration_seconds: Option<u64>,
+        password: String,
+    },
+    RevokeAccess {
+        id: String,
+        account: String,
+        revoker: String,
+        grant_id: String,
+        password: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Blockchain {
+    chain: Vec<Block>,
+    pending_transactions: Vec<Transaction>,
+    accounts: HashMap<String, Account>,
+    staked_tokens: HashMap<String, u64>,
+    executed_contracts: HashSet<String>,
+    #[serde(skip_serializing, skip_deserializing)]
+    encryption_keys: Option<EncryptionKeys>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum AccessRight {
+    ViewBalance,
+    ViewTransactions,
+    GrantAccess,
+    RevokeAccess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessGrant {
+    pub id: String,
+    pub grantee: String,
+    pub rights: HashSet<AccessRight>,
+    pub expires_at: Option<i64>,
+    pub granted_at: i64,
+    pub granted_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountGuard {
+    owner: String,
+    active_grants: HashMap<String, AccessGrant>,
+    revoked_grants: HashSet<String>,
+    password_hash: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Account {
+    balance: u64,
+    transaction_history: Vec<TransactionRecord>,
+    guard: AccountGuard,
+}
+
+impl EncryptionKeys {
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let bits = 2048;
+        let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
+        let public_key = RsaPublicKey::from(&private_key);
+        
+        Self {
+            public_key: public_key.to_pkcs1_der().unwrap().as_bytes().to_vec(),
+            private_key: private_key.to_pkcs1_der().unwrap().as_bytes().to_vec(),
+            aes_key: None,
+        }
+    }
+    
+    fn generate_aes_key(&mut self) -> Vec<u8> {
+        let key: [u8; 32] = rand::random();
+        self.aes_key = Some(key.to_vec());
+        key.to_vec()
+    }
+    
+    fn encrypt_with_rsa(&self, data: &[u8]) -> Vec<u8> {
+        let public_key = RsaPublicKey::from_pkcs1_der(&self.public_key).unwrap();
+        let mut rng = rand::thread_rng();
+        public_key.encrypt(&mut rng, Pkcs1v15Encrypt, data)
+            .expect("RSA encryption failed")
+    }
+    
+    fn decrypt_with_rsa(&self, data: &[u8]) -> Vec<u8> {
+        let private_key = RsaPrivateKey::from_pkcs1_der(&self.private_key).unwrap();
+        private_key.decrypt(Pkcs1v15Encrypt, data)
+            .expect("RSA decryption failed")
+    }
+    
+    fn encrypt_with_aes(&self, data: &[u8]) -> Vec<u8> {
+        let key = self.aes_key.as_ref().expect("AES key not initialized");
+        let iv: [u8; 16] = rand::random();
+        
+        let cipher = Aes256CbcEnc::new_from_slices(key, &iv).expect("Invalid key/iv length");
+        let mut buffer = iv.to_vec();
+        buffer.extend(cipher.encrypt_padded_vec_mut::<block_padding::Pkcs7>(data));
+        buffer
+    }
+    
+    fn decrypt_with_aes(&self, data: &[u8]) -> Vec<u8> {
+        if data.len() < 16 {
+            panic!("Invalid encrypted data length");
+        }
+        
+        let key = self.aes_key.as_ref().expect("AES key not initialized");
+        let iv = &data[..16];
+        let cipher = Aes256CbcDec::new_from_slices(key, iv).expect("Invalid key/iv length");
+        
+        cipher.decrypt_padded_vec_mut::<block_padding::Pkcs7>(&data[16..])
+            .expect("Decryption failed")
+    }
+}
+
+impl AccountGuard {
+    fn new(owner: &str, password: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            active_grants: HashMap::new(),
+            revoked_grants: HashSet::new(),
+            password_hash: hash_password(password),
+        }
+    }
+
+    fn grant_access(
+        &mut self,
+        granter: &str,
+        grantee: &str,
+        rights: Vec<AccessRight>,
+        duration: Option<std::time::Duration>,
+    ) -> Result<String, String> {
+        if granter != self.owner {
+            self.check_access(granter, &AccessRight::GrantAccess)?;
+        }
+
+        let grant_id = Uuid::new_v4().to_string();
+        let expires_at = duration.map(|d| Utc::now().timestamp() + d.as_secs() as i64);
+
+        let grant = AccessGrant {
+            id: grant_id.clone(),
+            grantee: grantee.to_string(),
+            rights: rights.into_iter().collect(),
+            expires_at,
+            granted_at: Utc::now().timestamp(),
+            granted_by: granter.to_string(),
+        };
+
+        self.active_grants.insert(grant_id.clone(), grant);
+        Ok(grant_id)
+    }
+
+    fn revoke_access(&mut self, revoker: &str, grant_id: &str) -> Result<(), String> {
+        let grant = self.active_grants.get(grant_id)
+            .ok_or("Grant not found")?;
+
+        if revoker != self.owner && revoker != grant.granted_by {
+            return Err("Unauthorized revocation attempt".into());
+        }
+
+        self.revoked_grants.insert(grant_id.to_string());
+        self.active_grants.remove(grant_id);
+        Ok(())
+    }
+
+    fn check_access(&self, requester: &str, right: &AccessRight) -> Result<(), String> {
+        if requester == self.owner {
+            return Ok(());
+        }
+
+        for grant in self.active_grants.values() {
+            if grant.grantee == requester &&
+               !self.revoked_grants.contains(&grant.id) &&
+               grant.rights.contains(right) &&
+               grant.expires_at.map_or(true, |exp| exp > Utc::now().timestamp())
+            {
+                return Ok(());
+            }
+        }
+
+        Err(format!("Missing {:?} access rights", right))
+    }
+
+    fn verify_password(&self, password: &str) -> bool {
+        hash_password(password) == self.password_hash
+    }
+}
+
 impl Block {
-    fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Block {
-        let timestamp = Utc::now().timestamp();
-        let mut block = Block {
+    fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Self {
+        let mut block = Self {
             index,
-            timestamp,
+            timestamp: Utc::now().timestamp(),
             transactions,
             previous_hash,
             hash: String::new(),
@@ -57,398 +288,362 @@ impl Block {
     }
 
     fn calculate_hash(&self) -> String {
-        let input = format!(
-            "{}{}{:?}{}{}",
-            self.index, self.timestamp, self.transactions, self.previous_hash, self.nonce
-        );
         let mut hasher = Sha256::new();
-        hasher.update(input);
+        hasher.update(serde_json::to_string(self).unwrap());
         format!("{:x}", hasher.finalize())
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Blockchain {
-    chain: Vec<Block>,
-    pending_transactions: Vec<Transaction>,
-    accounts: HashMap<String, u64>,
-    staked_tokens: HashMap<String, u64>,
-    executed_contracts: HashSet<String>,
+impl Default for Blockchain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SmartContract {
+    fn id(&self) -> &str {
+        match self {
+            Self::GetBalance { id, .. } => id,
+            Self::Transfer { id, .. } => id,
+            Self::GetTransactionHistory { id, .. } => id,
+            Self::GrantAccess { id, .. } => id,
+            Self::RevokeAccess { id, .. } => id,
+        }
+    }
 }
 
 impl Blockchain {
-    fn new() -> Blockchain {
-        let mut blockchain = Blockchain {
+    fn new() -> Self {
+        let mut bc = Self {
             chain: Vec::new(),
             pending_transactions: Vec::new(),
             accounts: HashMap::new(),
             staked_tokens: HashMap::new(),
             executed_contracts: HashSet::new(),
+            encryption_keys: None,
         };
-        blockchain.create_genesis_block();
-        blockchain
+        bc.create_genesis_block();
+        bc
+    }
+
+    fn encrypt_data(&self, data: &[u8]) -> Vec<u8> {
+        if let Some(keys) = &self.encryption_keys {
+            if keys.aes_key.is_some() {
+                return keys.encrypt_with_aes(data);
+            }
+        }
+        data.to_vec()
+    }
+
+    fn decrypt_data(&self, data: &[u8]) -> Vec<u8> {
+        if let Some(keys) = &self.encryption_keys {
+            if keys.aes_key.is_some() {
+                return keys.decrypt_with_aes(data);
+            }
+        }
+        data.to_vec()
     }
 
     fn create_genesis_block(&mut self) {
-        let genesis_block = Block::new(0, Vec::new(), "0".to_string());
-        self.chain.push(genesis_block);
+        self.chain.push(Block::new(0, Vec::new(), "0".into()));
     }
 
-    fn add_transaction(&mut self, sender: String, receiver: String, amount: u64, signature: Vec<u8>) {
-        let transaction = Transaction {
-            sender,
-            receiver,
-            amount,
-            signature,
-        };
-        self.pending_transactions.push(transaction);
-    }
-
-    fn stake_tokens(&mut self, staker: String, amount: u64) {
-        if self.get_balance(&staker) >= amount {
-            self.accounts.entry(staker.clone()).and_modify(|balance| *balance -= amount);
-            self.staked_tokens.entry(staker.clone()).and_modify(|stake| *stake += amount).or_insert(amount);
-            println!("Staked: {} tokens by {}", amount, staker);
-        } else {
-            println!("Staking failed: Insufficient balance for {}", staker);
+    fn execute_smart_contract(&mut self, contract: SmartContract) -> String {
+        let contract_id = contract.id().to_string();
+        if !self.executed_contracts.insert(contract_id.clone()) {
+            return format!("Contract {} already executed", contract_id);
         }
-    }
-
-    fn select_validator(&self) -> Option<String> {
-        let total_stake: u64 = self.staked_tokens.values().sum();
-        if total_stake == 0 {
-            return None;
-        }
-
-        let mut rng = rand::thread_rng();
-        let random_stake: u64 = rng.gen_range(0..total_stake);
-        let mut cumulative_stake = 0;
-
-        for (staker, stake) in &self.staked_tokens {
-            cumulative_stake += stake;
-            if cumulative_stake >= random_stake {
-                return Some(staker.clone());
-            }
-        }
-        None
-    }
-
-    fn mine_pending_transactions(&mut self, miner_address: String) {
-        if let Some(validator) = self.select_validator() {
-            if validator == miner_address {
-                let reward_transaction = Transaction {
-                    sender: "0".to_string(),
-                    receiver: miner_address.clone(),
-                    amount: 50,
-                    signature: Vec::new(),
-                };
-                self.pending_transactions.push(reward_transaction);
-
-                let mut block = Block::new(
-                    self.chain.len() as u64,
-                    self.pending_transactions.clone(),
-                    self.chain.last().unwrap().hash.clone(),
-                );
-                block.hash = block.calculate_hash();
-                self.chain.push(block);
-                self.pending_transactions.clear();
-                self.executed_contracts.clear();
-                println!("Block validated by: {}", miner_address);
-            } else {
-                println!("Mining failed: {} is not the selected validator", miner_address);
-            }
-        } else {
-            println!("Mining failed: No validators available");
-        }
-    }
-
-    fn get_balance(&self, address: &str) -> u64 {
-        *self.accounts.get(address).unwrap_or(&0)
-    }
-
-    fn save_to_file(&self, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let data = serde_json::to_string_pretty(self)?;
-        fs::write(filename, data)?;
-        Ok(())
-    }
-
-    fn load_from_file(filename: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let data = fs::read_to_string(filename)?;
-        let blockchain: Blockchain = serde_json::from_str(&data)?;
-        Ok(blockchain)
-    }
-
-    fn execute_smart_contract(&mut self, contract: SmartContract) {
-        let contract_id = match &contract {
-            SmartContract::Transfer { id, .. } => id,
-            SmartContract::Escrow { id, .. } => id,
-            SmartContract::Staking { id, .. } => id,
-            SmartContract::ReleaseEscrow { id, .. } => id,
-        };
-
-        if self.executed_contracts.contains(contract_id) {
-            println!("Contract already executed: {}", contract_id);
-            return;
-        }
-
-        self.executed_contracts.insert(contract_id.clone());
 
         match contract {
-            SmartContract::Transfer { sender, receiver, amount, .. } => {
-                if self.get_balance(&sender) >= amount {
-                    self.accounts.entry(sender.clone()).and_modify(|balance| *balance -= amount);
-                    self.accounts.entry(receiver.clone()).and_modify(|balance| *balance += amount);
-                    println!("Transfer: {} tokens sent from {} to {}", amount, sender, receiver);
-                } else {
-                    println!("Transfer failed: Insufficient balance for {}", sender);
+            SmartContract::GetBalance { address, requester, .. } => 
+                self.handle_balance_check(address, requester),
+            SmartContract::GetTransactionHistory { address, requester, .. } => {
+                match self.get_transaction_history(&address, &requester) {
+                    Some(history) => serde_json::to_string(&history).unwrap_or_default(),
+                    None => "Invalid credentials or account not found".into(),
                 }
             }
-            SmartContract::Escrow { sender, receiver, arbiter: _, amount, released: _, .. } => {
-                if self.get_balance(&sender) >= amount {
-                    self.accounts.entry(sender.clone()).and_modify(|balance| *balance -= amount);
-                    println!("Escrow: {} tokens held in escrow from {} to {}", amount, sender, receiver);
-                    self.pending_transactions.push(Transaction {
-                        sender,
-                        receiver,
-                        amount,
-                        signature: Vec::new(),
-                    });
-                } else {
-                    println!("Escrow failed: Insufficient balance for {}", sender);
-                }
+            SmartContract::Transfer { sender, receiver, amount, password, .. } => 
+                self.handle_transfer(sender, receiver, amount, password),
+            SmartContract::GrantAccess { account, granter, grantee, rights, duration_seconds, password, .. } => {
+                let duration = duration_seconds.map(|s| std::time::Duration::from_secs(s));
+                self.handle_grant_access(account, granter, grantee, rights, duration, password)
             }
-            SmartContract::Staking { staker, amount, duration, .. } => {
-                if self.get_balance(&staker) >= amount {
-                    self.stake_tokens(staker, amount);
-                    println!("Staking: {} tokens staked for {} blocks", amount, duration);
-                } else {
-                    println!("Staking failed: Insufficient balance for {}", staker);
-                }
-            }
-            SmartContract::ReleaseEscrow { escrow_id, arbiter, .. } => {
-                println!("Escrow {} released by arbiter {}", escrow_id, arbiter);
-            }
+            SmartContract::RevokeAccess { account, revoker, grant_id, password, .. } => 
+                self.handle_revoke_access(account, revoker, grant_id, password),
         }
     }
-}
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-enum SmartContract {
-    Transfer {
-        id: String,
-        sender: String,
-        receiver: String,
-        amount: u64,
-    },
-    Escrow {
-        id: String,
-        sender: String,
-        receiver: String,
-        arbiter: String,
-        amount: u64,
-        released: bool,
-    },
-    Staking {
-        id: String,
-        staker: String,
-        amount: u64,
-        duration: u64,
-    },
-    ReleaseEscrow {
-        id: String,
-        escrow_id: usize,
-        arbiter: String,
-    },
-}
-
-async fn broadcast_message(message: &str, peers: Vec<String>) {
-    for peer in peers {
-        let message = message.to_string();
-        tokio::spawn(async move {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(&peer).await {
-                if let Err(e) = stream.write_all(message.as_bytes()).await {
-                    eprintln!("Failed to send message to {}: {}", peer, e);
-                }
-            } else {
-                eprintln!("Failed to connect to peer: {}", peer);
-            }
-        });
-    }
-}
-
-async fn start_p2p_server(blockchain: Arc<Mutex<Blockchain>>, peers: Vec<String>, port: &str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
-    println!("P2P server started on 127.0.0.1:{}", port);
-
-    let seen_messages = Arc::new(Mutex::new(HashSet::new()));
-
-    loop {
-        match listener.accept().await {
-            Ok((mut socket, _)) => {
-                let blockchain = blockchain.clone();
-                let peers = peers.clone();
-                let seen_messages = seen_messages.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0; 1024];
-                    loop {
-                        match socket.read(&mut buf).await {
-                            Ok(n) if n > 0 => {
-                                let message = String::from_utf8_lossy(&buf[..n]);
-                                println!("Received raw message: {}", message);
-
-                                let message_id = match serde_json::from_str::<SmartContract>(&message) {
-                                    Ok(SmartContract::Transfer { id, .. }) => id,
-                                    Ok(SmartContract::Escrow { id, .. }) => id,
-                                    Ok(SmartContract::Staking { id, .. }) => id,
-                                    Ok(SmartContract::ReleaseEscrow { id, .. }) => id,
-                                    Err(_) => {
-                                        let mut hasher = Sha256::new();
-                                        hasher.update(&*message);
-                                        format!("{:x}", hasher.finalize())
-                                    }
-                                };
-
-                                {
-                                    let mut seen = seen_messages.lock().unwrap();
-                                    if seen.contains(&message_id) {
-                                        println!("Duplicate message detected, skipping: {}", message_id);
-                                        continue;
-                                    }
-                                    seen.insert(message_id.clone());
-                                }
-
-                                match serde_json::from_str::<SmartContract>(&message) {
-                                    Ok(contract) => {
-                                        let contract_clone = contract.clone();
-                                        {
-                                            let mut blockchain = blockchain.lock().unwrap();
-                                            blockchain.execute_smart_contract(contract);
-                                            blockchain.save_to_file("blockchain.json").unwrap_or_else(|e| {
-                                                eprintln!("Failed to save blockchain to file: {}", e);
-                                            });
-                                        }
-
-                                        let response = "Message received and processed";
-                                        if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                            eprintln!("Failed to send response: {}", e);
-                                        }
-
-                                        let serialized_contract = serde_json::to_string(&contract_clone).unwrap();
-                                        let peers_clone = peers.clone();
-                                        tokio::spawn(async move {
-                                            broadcast_message(&serialized_contract, peers_clone).await;
-                                        });
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to deserialize message: {}", e);
-                                        let response = format!("Failed to process message: {}", e);
-                                        if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                            eprintln!("Failed to send error response: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(_) => break,
-                            Err(e) => {
-                                eprintln!("Failed to read from socket: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-            Err(e) => eprintln!("Failed to accept connection: {}", e),
+    fn handle_balance_check(&self, address: String, requester: String) -> String {
+        match self.accounts.get(&address) {
+            Some(acc) => match acc.guard.check_access(&requester, &AccessRight::ViewBalance) {
+                Ok(_) => format!("Balance: {}", acc.balance),
+                Err(e) => e,
+            },
+            None => "Account not found".into(),
         }
     }
-}
 
-fn load_or_create_blockchain(filename: &str) -> Blockchain {
-    if Path::new(filename).exists() {
-        println!("Loading blockchain from file: {}", filename);
-        Blockchain::load_from_file(filename).unwrap_or_else(|_| {
-            println!("Failed to load blockchain from file. Creating a new one.");
-            let mut blockchain = Blockchain::new();
-            initialize_default_wallets(&mut blockchain);
-            blockchain
+    fn get_transaction_history(&self, address: &str, requester: &str) -> Option<Vec<TransactionRecord>> {
+        self.accounts.get(address).and_then(|acc| {
+            acc.guard.check_access(requester, &AccessRight::ViewTransactions)
+                .ok()
+                .map(|_| acc.transaction_history.clone())
         })
-    } else {
-        println!("Creating a new blockchain with default wallets.");
-        let mut blockchain = Blockchain::new();
-        initialize_default_wallets(&mut blockchain);
-        blockchain.save_to_file(filename).unwrap_or_else(|e| {
-            println!("Failed to save blockchain to file: {}", e);
-        });
-        blockchain
+    }
+
+    fn handle_transfer(&mut self, sender: String, receiver: String, amount: u64, password: String) -> String {
+        if sender == "0" {
+            let tx_id = Uuid::new_v4().to_string();
+            let timestamp = Utc::now().timestamp();
+            let block_height = self.chain.len() as u64;
+            
+            let record = TransactionRecord {
+                tx_id,
+                counterparty: "system".to_string(),
+                amount: amount as i64,
+                timestamp,
+                block_height: Some(block_height),
+            };
+
+            self.accounts.entry(receiver.clone())
+                .and_modify(|acc| {
+                    acc.balance += amount;
+                    acc.transaction_history.push(record.clone());
+                })
+                .or_insert(Account {
+                    balance: amount,
+                    transaction_history: vec![record],
+                    guard: AccountGuard::new(&receiver, ""),
+                });
+            
+            return format!("Mined {} tokens to {}", amount, receiver);
+        }
+
+        match self.accounts.get_mut(&sender) {
+            Some(acc) if acc.guard.verify_password(&password) => {
+                if acc.balance < amount {
+                    return format!("Insufficient balance: {}", acc.balance);
+                }
+                
+                let tx_id = Uuid::new_v4().to_string();
+                let timestamp = Utc::now().timestamp();
+                let block_height = self.chain.len() as u64;
+
+                acc.balance -= amount;
+                acc.transaction_history.push(TransactionRecord {
+                    tx_id: tx_id.clone(),
+                    counterparty: receiver.clone(),
+                    amount: -(amount as i64),
+                    timestamp,
+                    block_height: Some(block_height),
+                });
+
+                self.accounts.entry(receiver.clone())
+                    .and_modify(|acc| {
+                        acc.balance += amount;
+                        acc.transaction_history.push(TransactionRecord {
+                            tx_id: tx_id.clone(),
+                            counterparty: sender.clone(),
+                            amount: amount as i64,
+                            timestamp,
+                            block_height: Some(block_height),
+                        });
+                    })
+                    .or_insert(Account {
+                        balance: amount,
+                        transaction_history: vec![TransactionRecord {
+                            tx_id,
+                            counterparty: sender.clone(),
+                            amount: amount as i64,
+                            timestamp,
+                            block_height: Some(block_height),
+                        }],
+                        guard: AccountGuard::new(&receiver, ""),
+                    });
+
+                self.save_to_file("blockchain.json").unwrap();
+                format!("Transferred {} from {} to {}", amount, sender, receiver)
+            }
+            Some(_) => "Invalid password".into(),
+            None => "Sender account not found".into(),
+        }
+    }
+
+    fn handle_grant_access(
+        &mut self,
+        account: String,
+        granter: String,
+        grantee: String,
+        rights: Vec<AccessRight>,
+        duration: Option<std::time::Duration>,
+        password: String,
+    ) -> String {
+        match self.accounts.get_mut(&account) {
+            Some(acc) => {
+                if !acc.guard.verify_password(&password) {
+                    return "Invalid password".into();
+                }
+                match acc.guard.grant_access(&granter, &grantee, rights, duration) {
+                    Ok(id) => format!("Access granted with ID: {}", id),
+                    Err(e) => e,
+                }
+            }
+            None => "Account not found".into(),
+        }
+    }
+
+    fn handle_revoke_access(
+        &mut self,
+        account: String,
+        revoker: String,
+        grant_id: String,
+        password: String,
+    ) -> String {
+        match self.accounts.get_mut(&account) {
+            Some(acc) => {
+                if !acc.guard.verify_password(&password) {
+                    return "Invalid password".into();
+                }
+                match acc.guard.revoke_access(&revoker, &grant_id) {
+                    Ok(_) => "Access revoked successfully".into(),
+                    Err(e) => e,
+                }
+            }
+            None => "Account not found".into(),
+        }
+    }
+
+    fn save_to_file(&self, filename: &str) -> std::io::Result<()> {
+        let mut bc_for_serialization = self.clone();
+        bc_for_serialization.encryption_keys = None;
+        
+        let serialized = serde_json::to_string_pretty(&bc_for_serialization)?;
+        let encrypted = self.encrypt_data(serialized.as_bytes());
+        fs::write(filename, encrypted)
+    }
+
+    fn load_from_file(filename: &str, encryption_keys: Option<EncryptionKeys>) -> std::io::Result<Self> {
+        let encrypted = fs::read(filename)?;
+        
+        if encrypted.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Empty file",
+            ));
+        }
+
+        let temp_bc = Blockchain {
+            encryption_keys,
+            ..Default::default()
+        };
+        
+        let decrypted = temp_bc.decrypt_data(&encrypted);
+        let decrypted_str = String::from_utf8(decrypted)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let mut blockchain: Blockchain = serde_json::from_str(&decrypted_str)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        blockchain.encryption_keys = temp_bc.encryption_keys;
+        Ok(blockchain)
     }
 }
 
-fn initialize_default_wallets(blockchain: &mut Blockchain) {
-    blockchain.accounts.insert("alice.wallet".to_string(), 1000);
-    blockchain.accounts.insert("bob.wallet".to_string(), 500);
-    blockchain.accounts.insert("miner.wallet".to_string(), 0);
-    println!("Initialized default wallets with balances.");
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password);
+    format!("{:x}", hasher.finalize())
+}
+
+async fn handle_connection(mut stream: tokio::net::TcpStream, blockchain: Arc<Mutex<Blockchain>>) {
+    let mut buffer = [0; 1024];
+    match stream.read(&mut buffer).await {
+        Ok(n) if n > 0 => {
+            let message = String::from_utf8_lossy(&buffer[..n]);
+            let response = match serde_json::from_str::<SmartContract>(&message) {
+                Ok(contract) => blockchain.lock().unwrap().execute_smart_contract(contract),
+                Err(e) => format!("Invalid contract: {}", e),
+            };
+
+            if let Err(e) = stream.write_all(response.as_bytes()).await {
+                eprintln!("Failed to send response: {}", e);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    
+    let mut encryption_keys = EncryptionKeys::new();
+    encryption_keys.generate_aes_key();
 
-    let filename = "blockchain.json";
-    let blockchain = Arc::new(Mutex::new(load_or_create_blockchain(filename)));
-
-    let peers: Vec<String> = if args.peers.is_empty() {
-        Vec::new()
-    } else {
-        args.peers.split(',').map(|s| s.to_string()).collect()
+    let blockchain = match Blockchain::load_from_file("blockchain.json", Some(encryption_keys)) {
+        Ok(bc) => bc,
+        Err(_) => {
+            let mut new_bc = Blockchain::new();
+            new_bc.encryption_keys = Some(EncryptionKeys::new());
+            new_bc.encryption_keys.as_mut().unwrap().generate_aes_key();
+            
+            new_bc.accounts.insert("alice.wallet".into(), Account {
+                balance: 1000,
+                transaction_history: Vec::new(),
+                guard: AccountGuard::new("alice.wallet", "alice123"),
+            });
+            new_bc.accounts.insert("bob.wallet".into(), Account {
+                balance: 500,
+                transaction_history: Vec::new(),
+                guard: AccountGuard::new("bob.wallet", "bob123"),
+            });
+            new_bc.save_to_file("blockchain.json").unwrap();
+            new_bc
+        }
     };
 
-    let blockchain_clone = blockchain.clone();
-    let peers_clone = peers.clone();
-    tokio::spawn(async move {
-        start_p2p_server(blockchain_clone, peers_clone, &args.port).await;
-    });
-
-    let alice_address = "alice.wallet".to_string();
-    let bob_address = "bob.wallet".to_string();
-    let miner_address = "miner.wallet".to_string();
-
-    blockchain.lock().unwrap().stake_tokens(miner_address.clone(), 100);
-
-    let transfer_contract = SmartContract::Transfer {
-        id: Uuid::new_v4().to_string(),
-        sender: alice_address.clone(),
-        receiver: bob_address.clone(),
-        amount: 100,
-    };
-
-    blockchain.lock().unwrap().execute_smart_contract(transfer_contract);
-
-    let staking_contract = SmartContract::Staking {
-        id: Uuid::new_v4().to_string(),
-        staker: bob_address.clone(),
-        amount: 200,
-        duration: 100,
-    };
-
-    blockchain.lock().unwrap().execute_smart_contract(staking_contract);
-
-    blockchain.lock().unwrap().mine_pending_transactions(miner_address.clone());
-
-    println!("Alice's balance: {}", blockchain.lock().unwrap().get_balance(&alice_address));
-    println!("Bob's balance: {}", blockchain.lock().unwrap().get_balance(&bob_address));
-
-    blockchain.lock().unwrap().save_to_file(filename).unwrap_or_else(|e| {
-        println!("Failed to save blockchain to file: {}", e);
-    });
-
+    let blockchain = Arc::new(Mutex::new(blockchain));
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await?;
+    
+    println!("Server running on port {}", args.port);
+    
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        let (stream, _) = listener.accept().await?;
+        let blockchain = blockchain.clone();
+        tokio::spawn(async move {
+            handle_connection(stream, blockchain).await;
+        });
     }
 }
+/*
+{
+  "GrantAccess": {
+    "id": "unique-id-123",
+    "account": "alice.wallet",
+    "granter": "alice.wallet",
+    "grantee": "bob.wallet",
+    "rights": ["ViewBalance"],
+    "duration_seconds": 86400,
+    "password": "alice123"
+  }
+}
 
-//How to run
-//cargo run -- --port 8080 --peers 127.0.0.1:8081,127.0.0.1:8082
-//cargo run -- --port 8081 --peers 127.0.0.1:8080,127.0.0.1:8082
-//cargo run -- --port 8082 --peers 127.0.0.1:8080,127.0.0.1:8081
-//echo '{"Transfer":{"id":"550e8400-e29b-41d4-a716-4466554400004","sender":"bob.wallet","receiver":"alice.wallet","amount":10}}' | nc 127.0.0.1 8080
- 
+{
+  "GetBalance": {
+    "id": "unique-id-456",
+    "address": "alice.wallet",
+    "requester": "bob.wallet"
+  }
+}
+
+{
+  "RevokeAccess": {
+    "id": "unique-id-789",
+    "account": "alice.wallet",
+    "revoker": "alice.wallet",
+    "grant_id": "grant-id-from-response",
+    "password": "alice123"
+  }
+}
+
+*/
